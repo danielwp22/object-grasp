@@ -1,0 +1,6 @@
+dataclasses==0.6
+narwhals==1.42.1
+numpy==1.24.4
+packaging==26.0
+pathlib==1.0.1
+plotly==6.7.0
