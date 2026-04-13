@@ -48,13 +48,18 @@ PLAN_HORIZON    = 1.2           # max forward look-ahead (s)
 
 # Grasp geometry — offsets relative to object CoM, world frame
 PREGRASP_OFFSET = np.array([0.0,  0.10])
-GRASP_OFFSET    = np.array([0.0,  0.01])
+GRASP_OFFSET    = np.array([0.0,  0.00])
 POSTGRASP_LIFT  = np.array([0.0,  0.30])
 
 # Phase transition thresholds
 PREGRASP_DIST   = 0.10          # m — enter PRE_GRASP
-GRASP_DIST      = 0.08          # m — position close enough
+GRASP_DIST      = 0.015         # m — position close enough
+GRASP_REL_V_MAX = 0.20          # m/s — relative speed for closing grasp
 GRASP_T_WINDOW  = 0.12          # s — time-to-intercept for grasp trigger
+
+# Grasp success criteria (physical validation)
+GRASP_SPATIAL_TOL = 0.06        # m — EE must be within this distance of object (6cm)
+GRASP_VELOCITY_TOL = 0.55       # m/s — relative velocity must be below this (relaxed for fast objects)
 
 # PID gains
 KP = np.array([180.0, 180.0])
@@ -95,8 +100,13 @@ class ObjectSimulator:
         self.origin = start_pos.astype(float).copy()
         self.v0     = v0
         self.rng    = np.random.default_rng(42)
+        self.grasped = False
+        self.grasp_pos = None
+        self.grasp_vel = None
 
     def true_state(self, t: float):
+        if self.grasped and self.grasp_pos is not None:
+            return self.grasp_pos.copy(), self.grasp_vel.copy()
         s   = self.v0 * t + 0.5 * OBJ_A_RAMP * t**2
         v_s = self.v0 + OBJ_A_RAMP * t
         return self.origin + s * RAMP_DIR, v_s * RAMP_DIR
@@ -107,8 +117,21 @@ class ObjectSimulator:
         return pos + self.rng.normal(0, MEAS_STD, 2)
 
     def on_ramp(self, t: float) -> bool:
+        if self.grasped:
+            return True
         pos, _ = self.true_state(t)
         return bool(pos[1] > 0.0)
+
+    def attach(self, pos: np.ndarray, vel: np.ndarray):
+        self.grasped = True
+        self.grasp_pos = pos.astype(float).copy()
+        self.grasp_vel = vel.astype(float).copy()
+
+    def update_attached(self, pos: np.ndarray, vel: np.ndarray):
+        if not self.grasped:
+            return
+        self.grasp_pos = pos.astype(float).copy()
+        self.grasp_vel = vel.astype(float).copy()
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -200,11 +223,11 @@ class TrajectoryGenerator:
     x(tau) = x0 + dx*(10t^3 - 15t^4 + 6t^5), tau in [0,1]
     Zero velocity and acceleration at endpoints — smooth, no impulsive forces.
 
-    APPROACH:   targets pre-grasp pose above current p* (re-plans each step)
-    PRE_GRASP:  targets LOCKED p* (frozen at transition) to avoid chasing
-                the object. Velocity blends to match object velocity.
+    APPROACH:   targets pre-grasp pose above predicted intercept p*
+    PRE_GRASP:  actively tracks current object position and velocity (visual servoing)
+                to close the gap created by prediction errors
     GRASP:      rigidly tracks object CoM (gripper closed)
-    POST_GRASP: min-jerk lift to fixed pose above locked intercept point
+    POST_GRASP: min-jerk lift to fixed pose above grasp point
     """
     def min_jerk(self, x0, xf, t, T):
         tau = np.clip(t / T, 0.0, 1.0)
@@ -218,11 +241,10 @@ class TrajectoryGenerator:
             # This drives EE toward where the object WILL BE, not where it IS.
             return self.min_jerk(ee0, locked_pstar + spec.pregrasp, t_in, dur)
         elif phase == Phase.PRE_GRASP:
-            # Target FIXED locked intercept point with zero desired velocity.
-            # Velocity blending was removed — it dragged the EE in the object's
-            # direction after tau=1, pulling it away from the locked target.
-            pos, vel = self.min_jerk(ee0, locked_pstar + spec.grasp, t_in, dur)
-            return pos, np.zeros(2)
+            # Visual servoing: actively track current object position and velocity.
+            # This compensates for prediction errors by continuously updating target.
+            # Directly command object position + offset, with velocity matching.
+            return kf_pos + spec.grasp, kf_vel
         elif phase == Phase.GRASP:
             return kf_pos + spec.grasp, kf_vel
         elif phase == Phase.POST_GRASP:
@@ -328,6 +350,7 @@ def run_simulation():
     phase_ee0    = ee_start.copy()
     locked_pstar = obj_start.copy()   # frozen p* at PRE_GRASP entry
     locked_tstar  = PLAN_HORIZON         # frozen t* at PRE_GRASP entry
+    pregrasp_entry_t = 0.0               # time when we entered PRE_GRASP
     grasp_t      = None
 
     # Warm up KF — enough steps for velocity/accel estimates to converge
@@ -364,14 +387,20 @@ def run_simulation():
 
         # 6. Plant
         ee_pos, ee_vel = robot.step(u)
+        if obj.grasped:
+            obj.update_attached(ee_pos, ee_vel)
+            obj_pos, obj_vel = obj.true_state(t)
 
         # 7. Phase machine
         t_in_phase = t - phase_t0
+        # Distance to predicted intercept (for entering PRE_GRASP)
         dist_pregrasp = np.linalg.norm(ee_pos - (p_star + spec.pregrasp))
-        dist_grasp    = np.linalg.norm(ee_pos - (locked_pstar + spec.grasp))
+        # Distance to current object position (for tracking)
+        dist_to_obj = np.linalg.norm(ee_pos - obj_pos)
+        rel_speed = np.linalg.norm(ee_vel - obj_vel)
 
         def enter(p):
-            nonlocal phase, phase_t0, phase_ee0, locked_pstar
+            nonlocal phase, phase_t0, phase_ee0, locked_pstar, pregrasp_entry_t
             phase = p; phase_t0 = t; phase_ee0 = ee_pos.copy()
             pid.reset()
 
@@ -379,12 +408,25 @@ def run_simulation():
             locked_pstar = p_star.copy()   # keep updating best intercept estimate
             if dist_pregrasp < PREGRASP_DIST:
                 locked_tstar = t_star      # also freeze the time budget
+                pregrasp_entry_t = t       # record when we locked the intercept
                 enter(Phase.PRE_GRASP)
 
         elif phase == Phase.PRE_GRASP:
-            if dist_grasp < GRASP_DIST:
+            # Visual servoing approach: actively track the object until close enough.
+            # Trigger grasp when physical conditions are met:
+            # 1. EE is spatially close to object
+            # 2. Velocity is matched
+            actual_dist = np.linalg.norm(ee_pos - obj_pos)
+            actual_rel_vel = np.linalg.norm(ee_vel - obj_vel)
+
+            if actual_dist < GRASP_SPATIAL_TOL and actual_rel_vel < GRASP_VELOCITY_TOL:
+                # Physical conditions met - close gripper!
                 enter(Phase.GRASP)
                 grasp_t = t
+                obj.attach(obj_pos, obj_vel)
+            elif t_in_phase > 2.0:
+                # Timeout - couldn't achieve grasp conditions
+                enter(Phase.DONE)
 
         elif phase == Phase.GRASP and t_in_phase > 0.25:
             enter(Phase.POST_GRASP)
@@ -456,6 +498,7 @@ def plot_results(logger: DataLogger, grasp_t):
     obj, ee   = data["obj_pos"], data["ee_pos"]
     kfp, noisy = data["kf_pos"], data["noisy_pos"]
     err, ee_v  = data["pos_error"], data["ee_vel"]
+    speed = np.linalg.norm(ee_v, axis=1)
 
     fig = make_subplots(
         rows=3, cols=2,
@@ -563,7 +606,6 @@ def plot_results(logger: DataLogger, grasp_t):
         line=dict(color="#BA7517", width=1.5, dash="dot")), row=2, col=1)
 
     # [2,2] EE speed
-    speed = np.linalg.norm(ee_v, axis=1)
     fig.add_trace(go.Scatter(x=t, y=speed, name="|v_ee|",
         line=dict(color="#378ADD", width=1.5)), row=2, col=2)
     fig.add_hline(y=EE_V_MAX, line_dash="dash", line_color="#666",
@@ -605,9 +647,9 @@ def plot_results(logger: DataLogger, grasp_t):
     status = f"✓  grasp at t = {grasp_t:.3f} s" if grasp_t else "✗  no grasp achieved"
     fig.update_layout(
         title=f"Closed-loop PID grasp controller — ball on 30° ramp  ({status})",
-        height=980, template="plotly_dark",
-        legend=dict(orientation="h", y=-0.04, font=dict(size=10)),
-        margin=dict(l=60, r=40, t=70, b=60),
+        height=980, width=1400, template="plotly_dark",
+        legend=dict(orientation="h", y=-0.08, font=dict(size=10)),
+        margin=dict(l=70, r=40, t=80, b=80),
     )
     for r, c, xl, yl in [(1,1,"x (m)","y (m)"),(1,2,"time (s)","error (cm)"),
                           (2,1,"time (s)","x position (cm)"),(2,2,"time (s)","speed (m/s)"),
@@ -619,9 +661,129 @@ def plot_results(logger: DataLogger, grasp_t):
     out_dir.mkdir(parents=True, exist_ok=True)
     out = out_dir / "grasp_controller.html"
     fig.write_html(str(out))
+
+    assets_dir = Path("assets")
+    assets_dir.mkdir(parents=True, exist_ok=True)
+    png_out = assets_dir / "grasp_controller.png"
+    try:
+        fig.write_image(str(png_out), width=1400, height=980, scale=2)
+        _save_separate_figs(assets_dir, t, phases, obj, ee, kfp, noisy, err, speed, metrics, grasp_t)
+        print(f"Saved → {png_out}")
+    except Exception as exc:
+        print(f"Skipping PNG export (install kaleido to enable): {exc}")
+
     print(f"Saved → {out}")
     print(f"Metrics: {metrics}")
     print(f"Grasp:   {'t = '+str(grasp_t)+'s' if grasp_t else 'NOT ACHIEVED'}")
+
+
+def _save_separate_figs(assets_dir, t, phases, obj, ee, kfp, noisy, err, speed, metrics, grasp_t):
+    def _save(fig, name, width=1200, height=700):
+        fig.update_layout(template="plotly_white", margin=dict(l=60, r=30, t=60, b=60))
+        fig.write_image(str(assets_dir / name), width=width, height=height, scale=2)
+
+    # Trajectory
+    fig_traj = go.Figure()
+    ramp_s = np.linspace(0, 3.2, 80)
+    fig_traj.add_trace(go.Scatter(
+        x=ramp_s*RAMP_DIR[0], y=1.5+ramp_s*RAMP_DIR[1],
+        name="Ramp", mode="lines",
+        line=dict(color="#666", width=1, dash="dash")))
+    fig_traj.add_trace(go.Scatter(
+        x=noisy[:,0], y=noisy[:,1], name="Measurement",
+        mode="markers", marker=dict(color="#D85A30", size=3, opacity=0.25)))
+    fig_traj.add_trace(go.Scatter(
+        x=obj[:,0], y=obj[:,1], name="Object (truth)",
+        line=dict(color="#D85A30", width=2.5)))
+    fig_traj.add_trace(go.Scatter(
+        x=kfp[:,0], y=kfp[:,1], name="KF estimate",
+        line=dict(color="#BA7517", width=1.5, dash="dot")))
+    fig_traj.add_trace(go.Scatter(
+        x=ee[:,0], y=ee[:,1], name="End-effector",
+        line=dict(color="#378ADD", width=2.5)))
+    if grasp_t is not None:
+        idx = np.argmin(np.abs(t - grasp_t))
+        fig_traj.add_trace(go.Scatter(
+            x=[ee[idx,0]], y=[ee[idx,1]], name="Grasp",
+            mode="markers", marker=dict(symbol="star", size=16, color="#1D9E75",
+                                         line=dict(color="white", width=1))))
+    fig_traj.update_layout(title="Trajectory (world frame)")
+    fig_traj.update_xaxes(title_text="x (m)")
+    fig_traj.update_yaxes(title_text="y (m)")
+    _save(fig_traj, "trajectory.png", width=1100, height=800)
+
+    # Tracking error
+    fig_err = go.Figure()
+    fig_err.add_trace(go.Scatter(
+        x=t, y=err*100, name="Tracking error",
+        line=dict(color="#378ADD", width=2)))
+    if grasp_t is not None:
+        fig_err.add_vline(x=grasp_t, line_dash="dash",
+                          line_color="#1D9E75", annotation_text="grasp")
+    fig_err.update_layout(title="Tracking error vs time")
+    fig_err.update_xaxes(title_text="time (s)")
+    fig_err.update_yaxes(title_text="error (cm)")
+    _save(fig_err, "tracking_error.png")
+
+    # KF vs truth (x)
+    fig_kf = go.Figure()
+    fig_kf.add_trace(go.Scatter(x=t, y=noisy[:,0]*100, name="Measured x",
+        mode="markers", marker=dict(color="#D85A30", size=3, opacity=0.25)))
+    fig_kf.add_trace(go.Scatter(x=t, y=obj[:,0]*100, name="True x",
+        line=dict(color="#D85A30", width=2)))
+    fig_kf.add_trace(go.Scatter(x=t, y=kfp[:,0]*100, name="KF estimate x",
+        line=dict(color="#BA7517", width=1.5, dash="dot")))
+    fig_kf.update_layout(title="KF estimate vs ground truth (x-axis)")
+    fig_kf.update_xaxes(title_text="time (s)")
+    fig_kf.update_yaxes(title_text="x position (cm)")
+    _save(fig_kf, "kf_vs_truth.png")
+
+    # EE speed
+    fig_speed = go.Figure()
+    fig_speed.add_trace(go.Scatter(x=t, y=speed, name="|v_ee|",
+        line=dict(color="#378ADD", width=2)))
+    fig_speed.add_hline(y=EE_V_MAX, line_dash="dash", line_color="#666",
+        annotation_text=f"v_max = {EE_V_MAX} m/s")
+    fig_speed.update_layout(title="End-effector speed")
+    fig_speed.update_xaxes(title_text="time (s)")
+    fig_speed.update_yaxes(title_text="speed (m/s)")
+    _save(fig_speed, "ee_speed.png")
+
+    # Phase timeline
+    fig_phase = go.Figure()
+    segs = []
+    for i, ph in enumerate(phases):
+        if i == 0 or ph != phases[i-1]:
+            segs.append([ph, float(t[i])])
+    segs.append(["END", float(t[-1])])
+    for k in range(len(segs)-1):
+        ph, t0 = segs[k]; t1 = segs[k+1][1]
+        fig_phase.add_trace(go.Bar(
+            x=[t1-t0], y=[ph], base=[t0], orientation="h",
+            marker_color=PHASE_COLORS.get(ph, "#888780"),
+            opacity=0.85, showlegend=False))
+    fig_phase.update_layout(title="Phase timeline")
+    fig_phase.update_xaxes(title_text="time (s)")
+    _save(fig_phase, "phase_timeline.png", width=1100, height=450)
+
+    # Metrics table
+    gt = metrics.get("grasp_time_s")
+    rows_k = ["Overshoot","Settling time","Steady-state error","Grasp event"]
+    ov = metrics.get("overshoot_pct")
+    rows_v = [
+        f"{ov:.1f} %" if ov is not None else "—",
+        f"{metrics.get('settling_time_s', 0):.3f} s",
+        f"{metrics.get('steady_state_error_m', 0)*100:.2f} cm",
+        f"t = {gt:.3f} s" if gt else "not achieved",
+    ]
+    fig_tbl = go.Figure(data=[go.Table(
+        header=dict(values=["Metric","Value"], fill_color="#3C3489",
+                    font=dict(color="white", size=12), align="left"),
+        cells=dict(values=[rows_k, rows_v], fill_color="#f3f3f3",
+                   font=dict(color="#222", size=12), align="left")
+    )])
+    fig_tbl.update_layout(title="Performance metrics")
+    _save(fig_tbl, "metrics_table.png", width=900, height=450)
 
 
 # ─────────────────────────────────────────────────────────────────
