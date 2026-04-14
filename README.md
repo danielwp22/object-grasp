@@ -64,9 +64,16 @@ Continuously tracking the current object position (via Kalman filter) compensate
 
 ### Tuning methodology
 
-Systematically compared 5 tuning methods (Ziegler-Nichols, Cohen-Coon, IMC, Lambda, Optimization) using `tune_pid_advanced.py`.
+Systematically compared 5 tuning methods (Ziegler-Nichols, Cohen-Coon, IMC, Lambda, Optimization) using `tune_pid_advanced.py`:
 
-**Critical lesson**: Mathematical optimization for ideal step responses can fail catastrophically on real tasks. "Optimal" gains predicted perfect performance but completely failed due to noise amplification and saturation. Conservative empirical tuning (Kp=180, Ki=40, Kd=15) proved robust.
+![PID Tuning Comparison](assets/pid_tuning_comparison.png)
+
+**How the K values were chosen:**
+- Tested all 5 systematic tuning methods on step response
+- Cohen-Coon method (orange) provided good balance: low overshoot (~6%), fast settling (~0.4s), good stability margin
+- Final gains (Kp=180, Ki=40, Kd=15) are close to Cohen-Coon with conservative Kd to reduce noise amplification
+
+**Critical lesson**: Mathematical optimization (Optimized ITAE) predicted perfect step response but completely failed on the real task due to noise amplification and saturation. The scatter plot (top-right) shows Cohen-Coon offers the best overshoot/settling time tradeoff among practical methods.
 
 ## Control parameters
 
