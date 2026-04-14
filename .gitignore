@@ -1,3 +1,6 @@
 outputs/grasp_controller.html
 object_grasp.py
 .venv/
+.claude/
+PID_TUNING_LESSONS.md
+__pycache__/

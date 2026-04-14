@@ -5,3 +5,5 @@ packaging==26.0
 pathlib==1.0.1
 plotly==6.7.0
 kaleido==0.2.1
+matplotlib>=3.5.0
+scipy>=1.9.0

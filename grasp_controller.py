@@ -61,11 +61,12 @@ GRASP_T_WINDOW  = 0.12          # s — time-to-intercept for grasp trigger
 GRASP_SPATIAL_TOL = 0.06        # m — EE must be within this distance of object (6cm)
 GRASP_VELOCITY_TOL = 0.55       # m/s — relative velocity must be below this (relaxed for fast objects)
 
-# PID gains
+# PID + Feedforward gains (empirical tuning, close to Cohen-Coon recommendation)
 KP = np.array([180.0, 180.0])
 KI = np.array([40.0,  40.0])
-KD = np.array([28.0,  28.0])
+KD = np.array([15.0,  15.0])  # Conservative Kd to minimize noise amplification
 I_CLAMP = 0.25
+D_FILTER_TAU = 0.01  # Derivative filter time constant (s) - low-pass to reduce noise
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -230,26 +231,57 @@ class TrajectoryGenerator:
     POST_GRASP: min-jerk lift to fixed pose above grasp point
     """
     def min_jerk(self, x0, xf, t, T):
+        """Minimum jerk trajectory with position, velocity, and acceleration."""
         tau = np.clip(t / T, 0.0, 1.0)
-        pos = x0 + (xf - x0) * (10*tau**3 - 15*tau**4 + 6*tau**5)
-        vel = (xf - x0) / max(T, 1e-6) * (30*tau**2 - 60*tau**3 + 30*tau**4)
-        return pos, vel
+        dx = xf - x0
+        T_safe = max(T, 1e-6)
 
-    def desired(self, phase, t_in, dur, ee0, kf_pos, kf_vel, locked_pstar, spec):
+        pos = x0 + dx * (10*tau**3 - 15*tau**4 + 6*tau**5)
+        vel = dx / T_safe * (30*tau**2 - 60*tau**3 + 30*tau**4)
+        acc = dx / T_safe**2 * (60*tau - 180*tau**2 + 120*tau**3)
+
+        return pos, vel, acc
+
+    def desired(self, phase, t_in, dur, ee0, kf_pos, kf_vel, kf_acc, locked_pstar, spec):
+        """Generate desired trajectory with position, velocity, and acceleration."""
+        # Physics-based acceleration for the ball (constant, known from ramp dynamics)
+        ball_acc = OBJ_A_RAMP * RAMP_DIR
+
         if phase == Phase.APPROACH:
             # Target predicted intercept point, not current object position.
             # This drives EE toward where the object WILL BE, not where it IS.
             return self.min_jerk(ee0, locked_pstar + spec.pregrasp, t_in, dur)
+
         elif phase == Phase.PRE_GRASP:
             # Visual servoing: actively track current object position and velocity.
-            # This compensates for prediction errors by continuously updating target.
-            # Directly command object position + offset, with velocity matching.
-            return kf_pos + spec.grasp, kf_vel
+            # Smooth transition using S-curve (3rd order polynomial) to minimize jerk
+            # and reduce transient tracking error spike at phase entry.
+            # Use physics-based acceleration (smooth, known) instead of noisy KF estimate.
+            blend_time = 0.05  # 10 timesteps @ 200Hz - smooth S-curve transition
+            if t_in < blend_time:
+                # S-curve: tau^3 * (6*tau^2 - 15*tau + 10)
+                tau = t_in / blend_time
+                alpha = tau**3 * (6*tau**2 - 15*tau + 10)  # Smooth 0→1 transition
+                target_pos = (1 - alpha) * (locked_pstar + spec.pregrasp) + alpha * (kf_pos + spec.grasp)
+                target_vel = alpha * kf_vel
+                target_acc = alpha * ball_acc  # Use physics model, not noisy KF
+            else:
+                target_pos = kf_pos + spec.grasp
+                target_vel = kf_vel
+                target_acc = ball_acc  # Use physics model, not noisy KF
+            return target_pos, target_vel, target_acc
+
         elif phase == Phase.GRASP:
-            return kf_pos + spec.grasp, kf_vel
+            # Object is grasped - hold it stationary (zero velocity/acceleration)
+            # Prevents drift during the grasp-hold period before lifting
+            return kf_pos + spec.grasp, np.zeros(2), np.zeros(2)
+
         elif phase == Phase.POST_GRASP:
-            return self.min_jerk(ee0, locked_pstar + spec.postgrasp, t_in, max(dur, 1.0))
-        return ee0.copy(), np.zeros(2)
+            # Lift from actual grasp position (ee0), not from old prediction (locked_pstar)
+            lift_target = ee0 + spec.postgrasp
+            return self.min_jerk(ee0, lift_target, t_in, max(dur, 1.0))
+
+        return ee0.copy(), np.zeros(2), np.zeros(2)
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -257,27 +289,76 @@ class TrajectoryGenerator:
 # ─────────────────────────────────────────────────────────────────
 class PIDController:
     """
-    u = Kp*e_pos + Ki*integral(e_pos) + Kd*(d/dt(e_pos) + e_vel)
+    Feedforward + Feedback control:
+    u = u_feedforward + u_feedback
 
-    Integral term eliminates steady-state error when tracking an
-    accelerating target — a PD controller cannot do this alone.
-    Anti-windup clamps prevent integrator blowup during large transients.
+    Feedforward (model-based):
+      u_ff = m*a_desired + b*v_desired
+      Inverts plant dynamics to anticipate required control
+
+    Feedback (error-driven):
+      u_fb = Kp*e_pos + Ki*integral(e_pos) + Kd*filtered(de_pos/dt + e_vel)
+      Corrects for model uncertainties and disturbances
+
+    Derivative filtering:
+      Low-pass filter on derivative term to reduce high-frequency noise amplification
+      d_filtered[k] = α*d_raw[k] + (1-α)*d_filtered[k-1]
+      where α = DT/(DT + τ), τ = filter time constant
+
+    Benefits:
+    - Feedforward provides bulk of control → smaller tracking errors
+    - Feedback handles residual errors → robustness
+    - Derivative filter reduces chattering from sensor noise
+    - Combined: fast response + accuracy + robustness
     """
-    def __init__(self):
+    def __init__(self, use_feedforward=True, ff_gain=1.0):
         self.integral   = np.zeros(2)
         self.prev_error = np.zeros(2)
+        self.d_filtered = np.zeros(2)  # Filtered derivative term
+        self.use_feedforward = use_feedforward
+        self.ff_gain = ff_gain  # Feedforward gain (0-1), allows detuning if model uncertain
 
     def reset(self):
         self.integral   = np.zeros(2)
         self.prev_error = np.zeros(2)
+        self.d_filtered = np.zeros(2)
 
-    def compute(self, des_pos, des_vel, ee_pos, ee_vel):
+    def compute(self, des_pos, des_vel, ee_pos, ee_vel, des_acc=None):
+        """
+        Compute control with feedforward + feedback.
+
+        Args:
+            des_pos: desired position
+            des_vel: desired velocity
+            ee_pos: actual position
+            ee_vel: actual velocity
+            des_acc: desired acceleration (optional, for feedforward)
+        """
+        # Feedback control (error-driven)
         e_pos = des_pos - ee_pos
         e_vel = des_vel - ee_vel
         self.integral  = np.clip(self.integral + e_pos * DT, -I_CLAMP, I_CLAMP)
-        d_term         = (e_pos - self.prev_error) / DT
+
+        # Raw derivative term
+        d_raw = (e_pos - self.prev_error) / DT + e_vel
         self.prev_error = e_pos.copy()
-        return KP * e_pos + KI * self.integral + KD * (d_term + e_vel)
+
+        # Low-pass filter on derivative to reduce noise amplification
+        # First-order discrete filter: α = DT/(DT + τ)
+        alpha = DT / (DT + D_FILTER_TAU)
+        self.d_filtered = alpha * d_raw + (1 - alpha) * self.d_filtered
+
+        u_feedback = KP * e_pos + KI * self.integral + KD * self.d_filtered
+
+        # Feedforward control (model-based)
+        if self.use_feedforward and des_acc is not None:
+            # Invert plant dynamics: u = m*a + b*v
+            u_feedforward = EE_MASS * des_acc + EE_DAMPING * des_vel
+            u_feedforward *= self.ff_gain  # Allow detuning
+        else:
+            u_feedforward = np.zeros(2)
+
+        return u_feedforward + u_feedback
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -340,7 +421,7 @@ def run_simulation():
     kf    = KalmanFilter(obj_start)
     plan  = InterceptPlanner()
     traj  = TrajectoryGenerator()
-    pid   = PIDController()
+    pid   = PIDController(use_feedforward=True, ff_gain=0.7)  # Reduced gain to minimize chattering
     robot = RobotPlant(ee_start)
     spec  = GraspSpec()
     log   = DataLogger()
@@ -370,20 +451,21 @@ def run_simulation():
         x_hat  = kf.update(z)
         kf_pos = x_hat[:2]
         kf_vel = x_hat[2:4]
+        kf_acc = x_hat[4:6]  # Extract acceleration estimate from KF state
 
         # 3. Plan
         ee_pos, ee_vel = robot.pos.copy(), robot.vel.copy()
         t_star, p_star, v_star = plan.solve(kf, ee_pos)
 
-        # 4. Trajectory
+        # 4. Trajectory (now returns pos, vel, acc for feedforward control)
         t_in = t - phase_t0
         dur  = max(locked_tstar if phase == Phase.PRE_GRASP else t_star, 0.15)
-        des_pos, des_vel = traj.desired(
+        des_pos, des_vel, des_acc = traj.desired(
             phase, t_in, dur, phase_ee0,
-            kf_pos, kf_vel, locked_pstar, spec)
+            kf_pos, kf_vel, kf_acc, locked_pstar, spec)
 
-        # 5. PID
-        u = pid.compute(des_pos, des_vel, ee_pos, ee_vel)
+        # 5. Feedforward + Feedback control
+        u = pid.compute(des_pos, des_vel, ee_pos, ee_vel, des_acc)
 
         # 6. Plant
         ee_pos, ee_vel = robot.step(u)
@@ -402,7 +484,10 @@ def run_simulation():
         def enter(p):
             nonlocal phase, phase_t0, phase_ee0, locked_pstar, pregrasp_entry_t
             phase = p; phase_t0 = t; phase_ee0 = ee_pos.copy()
-            pid.reset()
+            # Don't reset PID integral on PRE_GRASP transition to avoid losing
+            # accumulated compensation. Only reset on major transitions.
+            if p in [Phase.APPROACH, Phase.POST_GRASP]:
+                pid.reset()
 
         if phase == Phase.APPROACH:
             locked_pstar = p_star.copy()   # keep updating best intercept estimate
