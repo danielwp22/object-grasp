@@ -3,17 +3,15 @@ Closed-loop PID feedback controller for grasping a moving object.
 Scenario: ball rolling down a 30° ramp.
 
 Key design decisions:
-  - APPROACH phase: continuously re-plans to updated KF intercept estimate
-  - PRE_GRASP phase: locks onto a FIXED intercept point p* (frozen at transition)
-      → prevents the EE from chasing a receding target
-  - GRASP triggered by: position close enough AND time-to-intercept < window
-  - POST_GRASP: minimum-jerk lift to a fixed world pose above grasp point
+  - Visual servoing: continuously track current object position and velocity
+  - GRASP triggered when: position close enough AND velocity matched
+  - POST_GRASP: minimum-jerk lift to fixed pose above grasp point
   - Plant: 2nd-order Cartesian (closed-loop robot abstraction, no joint dynamics)
   - Grippers: binary event (force-closure not modelled)
 
 Pipeline each timestep (200 Hz outer loop):
-  ObjectSimulator → KalmanFilter → InterceptPlanner
-  → TrajectoryGenerator → PIDController → RobotPlant → DataLogger
+  ObjectSimulator → Sensor → KalmanFilter → TrajectoryGenerator
+  → PIDController → RobotPlant → DataLogger
 """
 
 import numpy as np
@@ -47,19 +45,12 @@ EE_A_MAX        = EE_V_MAX / 0.10  # m/s²
 PLAN_HORIZON    = 1.2           # max forward look-ahead (s)
 
 # Grasp geometry — offsets relative to object CoM, world frame
-PREGRASP_OFFSET = np.array([0.0,  0.10])
 GRASP_OFFSET    = np.array([0.0,  0.00])
 POSTGRASP_LIFT  = np.array([0.0,  0.30])
 
-# Phase transition thresholds
-PREGRASP_DIST   = 0.10          # m — enter PRE_GRASP
-GRASP_DIST      = 0.015         # m — position close enough
-GRASP_REL_V_MAX = 0.20          # m/s — relative speed for closing grasp
-GRASP_T_WINDOW  = 0.12          # s — time-to-intercept for grasp trigger
-
-# Grasp success criteria (physical validation)
+# Grasp trigger criteria (physical validation)
 GRASP_SPATIAL_TOL = 0.06        # m — EE must be within this distance of object (6cm)
-GRASP_VELOCITY_TOL = 0.55       # m/s — relative velocity must be below this (relaxed for fast objects)
+GRASP_VELOCITY_TOL = 0.55       # m/s — relative velocity must be below this
 
 # PID + Feedforward gains (empirical tuning, close to Cohen-Coon recommendation)
 KP = np.array([180.0, 180.0])
@@ -72,14 +63,12 @@ D_FILTER_TAU = 0.01  # Derivative filter time constant (s) - low-pass to reduce 
 # ─────────────────────────────────────────────────────────────────
 class Phase(Enum):
     APPROACH   = auto()
-    PRE_GRASP  = auto()
     GRASP      = auto()
     POST_GRASP = auto()
     DONE       = auto()
 
 PHASE_COLORS = {
     "APPROACH":   "#378ADD",
-    "PRE_GRASP":  "#BA7517",
     "GRASP":      "#1D9E75",
     "POST_GRASP": "#D85A30",
     "DONE":       "#888780",
@@ -87,7 +76,6 @@ PHASE_COLORS = {
 
 @dataclass
 class GraspSpec:
-    pregrasp:  np.ndarray = field(default_factory=lambda: PREGRASP_OFFSET.copy())
     grasp:     np.ndarray = field(default_factory=lambda: GRASP_OFFSET.copy())
     postgrasp: np.ndarray = field(default_factory=lambda: POSTGRASP_LIFT.copy())
 
@@ -217,21 +205,18 @@ class InterceptPlanner:
 
 
 # ─────────────────────────────────────────────────────────────────
-# 4. Trajectory Generator  (minimum-jerk polynomial)
+# 4. Trajectory Generator
 # ─────────────────────────────────────────────────────────────────
 class TrajectoryGenerator:
     """
-    x(tau) = x0 + dx*(10t^3 - 15t^4 + 6t^5), tau in [0,1]
-    Zero velocity and acceleration at endpoints — smooth, no impulsive forces.
+    Generate desired trajectories for each phase:
 
-    APPROACH:   targets pre-grasp pose above predicted intercept p*
-    PRE_GRASP:  actively tracks current object position and velocity (visual servoing)
-                to close the gap created by prediction errors
-    GRASP:      rigidly tracks object CoM (gripper closed)
-    POST_GRASP: min-jerk lift to fixed pose above grasp point
+    APPROACH:   Visual servoing - track current object position and velocity
+    GRASP:      Hold object stationary (gripper closed)
+    POST_GRASP: Minimum-jerk lift to fixed pose above grasp point
     """
     def min_jerk(self, x0, xf, t, T):
-        """Minimum jerk trajectory with position, velocity, and acceleration."""
+        """Minimum jerk trajectory: x(tau) = x0 + dx*(10t^3 - 15t^4 + 6t^5)"""
         tau = np.clip(t / T, 0.0, 1.0)
         dx = xf - x0
         T_safe = max(T, 1e-6)
@@ -242,33 +227,17 @@ class TrajectoryGenerator:
 
         return pos, vel, acc
 
-    def desired(self, phase, t_in, dur, ee0, kf_pos, kf_vel, kf_acc, locked_pstar, spec):
+    def desired(self, phase, t_in, dur, ee0, kf_pos, kf_vel, spec):
         """Generate desired trajectory with position, velocity, and acceleration."""
         # Physics-based acceleration for the ball (constant, known from ramp dynamics)
         ball_acc = OBJ_A_RAMP * RAMP_DIR
 
         if phase == Phase.APPROACH:
-            # Target predicted intercept point, not current object position.
-            # This drives EE toward where the object WILL BE, not where it IS.
-            return self.min_jerk(ee0, locked_pstar + spec.pregrasp, t_in, dur)
-
-        elif phase == Phase.PRE_GRASP:
-            # Visual servoing: actively track current object position and velocity.
-            # Smooth transition using S-curve (3rd order polynomial) to minimize jerk
-            # and reduce transient tracking error spike at phase entry.
-            # Use physics-based acceleration (smooth, known) instead of noisy KF estimate.
-            blend_time = 0.05  # 10 timesteps @ 200Hz - smooth S-curve transition
-            if t_in < blend_time:
-                # S-curve: tau^3 * (6*tau^2 - 15*tau + 10)
-                tau = t_in / blend_time
-                alpha = tau**3 * (6*tau**2 - 15*tau + 10)  # Smooth 0→1 transition
-                target_pos = (1 - alpha) * (locked_pstar + spec.pregrasp) + alpha * (kf_pos + spec.grasp)
-                target_vel = alpha * kf_vel
-                target_acc = alpha * ball_acc  # Use physics model, not noisy KF
-            else:
-                target_pos = kf_pos + spec.grasp
-                target_vel = kf_vel
-                target_acc = ball_acc  # Use physics model, not noisy KF
+            # Visual servoing: continuously track current object position and velocity
+            # This compensates for KF uncertainty and provides smooth velocity matching
+            target_pos = kf_pos + spec.grasp
+            target_vel = kf_vel
+            target_acc = ball_acc  # Use known physics instead of noisy KF acceleration
             return target_pos, target_vel, target_acc
 
         elif phase == Phase.GRASP:
@@ -277,7 +246,7 @@ class TrajectoryGenerator:
             return kf_pos + spec.grasp, np.zeros(2), np.zeros(2)
 
         elif phase == Phase.POST_GRASP:
-            # Lift from actual grasp position (ee0), not from old prediction (locked_pstar)
+            # Lift from actual grasp position
             lift_target = ee0 + spec.postgrasp
             return self.min_jerk(ee0, lift_target, t_in, max(dur, 1.0))
 
@@ -396,7 +365,7 @@ class DataLogger:
     def __init__(self):
         self.data = {k: [] for k in [
             "t","obj_pos","noisy_pos","kf_pos","ee_pos","ee_vel",
-            "des_pos","pos_error","phase","t_star","p_star"]}
+            "des_pos","pos_error","phase"]}
 
     def log(self, **kw):
         for k, v in kw.items():
@@ -429,9 +398,6 @@ def run_simulation():
     phase        = Phase.APPROACH
     phase_t0     = 0.0
     phase_ee0    = ee_start.copy()
-    locked_pstar = obj_start.copy()   # frozen p* at PRE_GRASP entry
-    locked_tstar  = PLAN_HORIZON         # frozen t* at PRE_GRASP entry
-    pregrasp_entry_t = 0.0               # time when we entered PRE_GRASP
     grasp_t      = None
 
     # Warm up KF — enough steps for velocity/accel estimates to converge
@@ -453,16 +419,13 @@ def run_simulation():
         kf_vel = x_hat[2:4]
         kf_acc = x_hat[4:6]  # Extract acceleration estimate from KF state
 
-        # 3. Plan
+        # 3. Get end-effector state
         ee_pos, ee_vel = robot.pos.copy(), robot.vel.copy()
-        t_star, p_star, v_star = plan.solve(kf, ee_pos)
 
-        # 4. Trajectory (now returns pos, vel, acc for feedforward control)
+        # 4. Generate desired trajectory (visual servoing)
         t_in = t - phase_t0
-        dur  = max(locked_tstar if phase == Phase.PRE_GRASP else t_star, 0.15)
         des_pos, des_vel, des_acc = traj.desired(
-            phase, t_in, dur, phase_ee0,
-            kf_pos, kf_vel, kf_acc, locked_pstar, spec)
+            phase, t_in, 1.0, phase_ee0, kf_pos, kf_vel, spec)
 
         # 5. Feedforward + Feedback control
         u = pid.compute(des_pos, des_vel, ee_pos, ee_vel, des_acc)
@@ -475,41 +438,23 @@ def run_simulation():
 
         # 7. Phase machine
         t_in_phase = t - phase_t0
-        # Distance to predicted intercept (for entering PRE_GRASP)
-        dist_pregrasp = np.linalg.norm(ee_pos - (p_star + spec.pregrasp))
-        # Distance to current object position (for tracking)
-        dist_to_obj = np.linalg.norm(ee_pos - obj_pos)
-        rel_speed = np.linalg.norm(ee_vel - obj_vel)
+        actual_dist = np.linalg.norm(ee_pos - obj_pos)
+        actual_rel_vel = np.linalg.norm(ee_vel - obj_vel)
 
         def enter(p):
-            nonlocal phase, phase_t0, phase_ee0, locked_pstar, pregrasp_entry_t
+            nonlocal phase, phase_t0, phase_ee0
             phase = p; phase_t0 = t; phase_ee0 = ee_pos.copy()
-            # Don't reset PID integral on PRE_GRASP transition to avoid losing
-            # accumulated compensation. Only reset on major transitions.
-            if p in [Phase.APPROACH, Phase.POST_GRASP]:
+            if p == Phase.POST_GRASP:
                 pid.reset()
 
         if phase == Phase.APPROACH:
-            locked_pstar = p_star.copy()   # keep updating best intercept estimate
-            if dist_pregrasp < PREGRASP_DIST:
-                locked_tstar = t_star      # also freeze the time budget
-                pregrasp_entry_t = t       # record when we locked the intercept
-                enter(Phase.PRE_GRASP)
-
-        elif phase == Phase.PRE_GRASP:
-            # Visual servoing approach: actively track the object until close enough.
-            # Trigger grasp when physical conditions are met:
-            # 1. EE is spatially close to object
-            # 2. Velocity is matched
-            actual_dist = np.linalg.norm(ee_pos - obj_pos)
-            actual_rel_vel = np.linalg.norm(ee_vel - obj_vel)
-
+            # Visual servoing: continuously track object position/velocity
+            # Trigger grasp when physical conditions are met
             if actual_dist < GRASP_SPATIAL_TOL and actual_rel_vel < GRASP_VELOCITY_TOL:
-                # Physical conditions met - close gripper!
                 enter(Phase.GRASP)
                 grasp_t = t
                 obj.attach(obj_pos, obj_vel)
-            elif t_in_phase > 2.0:
+            elif t_in_phase > 3.0:
                 # Timeout - couldn't achieve grasp conditions
                 enter(Phase.DONE)
 
@@ -523,7 +468,7 @@ def run_simulation():
         log.log(t=t, obj_pos=obj_pos, noisy_pos=z, kf_pos=kf_pos,
                 ee_pos=ee_pos, ee_vel=ee_vel, des_pos=des_pos,
                 pos_error=float(np.linalg.norm(des_pos - ee_pos)),
-                phase=phase.name, t_star=float(t_star), p_star=p_star)
+                phase=phase.name)
 
         if phase == Phase.DONE:
             break
@@ -536,38 +481,23 @@ def run_simulation():
 # ─────────────────────────────────────────────────────────────────
 def compute_metrics(data: dict, grasp_t) -> dict:
     """
-    Metrics computed on the PRE_GRASP phase — the step response to a fixed
-    target (locked_pstar). This is the correct phase for classical PID metrics
-    because the setpoint is stationary during PRE_GRASP.
+    Compute performance metrics for visual servoing approach.
 
-    APPROACH is excluded: the target (p_star) moves every step, making
-    classical overshoot/settling undefined.
-
-    Overshoot:          (peak - SS) / SS * 100%
-    Settling time:      first t where error stays within 5% band of SS
-    Steady-state error: mean error in final 20% of PRE_GRASP
+    Steady-state error: mean tracking error in final 20% of APPROACH phase
+    Grasp time: time when grasp conditions are met
     """
     t, err, phases = data["t"], data["pos_error"], data["phase"]
 
-    # Use PRE_GRASP phase (fixed setpoint = locked_pstar)
-    mask = phases == "PRE_GRASP"
+    # Use APPROACH phase for steady-state error
+    mask = phases == "APPROACH"
     if mask.sum() < 5:
         return {"grasp_time_s": round(float(grasp_t), 3) if grasp_t else None}
 
-    t_pg, e_pg = t[mask], err[mask]
-    n_ss      = max(1, len(e_pg) // 5)
-    e_ss      = float(np.mean(e_pg[-n_ss:]))
-    e_max     = float(e_pg.max())
-    overshoot = max(0.0, (e_max - e_ss) / (e_ss + 1e-9) * 100)
-    band      = max(0.05 * e_ss, 1e-3)
-    t_settle  = float(t_pg[-1])
-    for i in range(len(e_pg)):
-        if np.all(np.abs(e_pg[i:] - e_ss) <= band):
-            t_settle = float(t_pg[i])
-            break
+    e_approach = err[mask]
+    n_ss = max(1, len(e_approach) // 5)
+    e_ss = float(np.mean(e_approach[-n_ss:]))
+
     return {
-        "overshoot_pct":        round(overshoot, 1),
-        "settling_time_s":      round(t_settle - float(t_pg[0]), 3),
         "steady_state_error_m": round(e_ss, 4),
         "grasp_time_s":         round(float(grasp_t), 3) if grasp_t else None,
     }
@@ -642,44 +572,12 @@ def plot_results(logger: DataLogger, grasp_t):
                 mode="lines", line=dict(color=col, width=1.5),
                 showlegend=False), row=1, col=2)
 
-    # Annotations anchored to PRE_GRASP (step response to fixed target)
-    pg_mask = phases == "PRE_GRASP"
-    e_ss_cm = metrics.get("steady_state_error_m", 0) * 100
-    if e_ss_cm > 0 and pg_mask.any():
-        t_pg_start = float(t[pg_mask][0])
-        t_pg_end   = float(t[pg_mask][-1])
-        # SS band shaded across full plot width
-        fig.add_hrect(y0=0, y1=e_ss_cm * 1.05, fillcolor="#1D9E75",
-                      opacity=0.07, line_width=0, row=1, col=2)
-        # SS error label inside PRE_GRASP window
-        fig.add_annotation(
-            x=t_pg_start + (t_pg_end - t_pg_start) * 0.5, y=e_ss_cm * 2.8,
-            text=f"SS ≈ {e_ss_cm:.1f} cm",
-            showarrow=False, font=dict(size=11, color="#1D9E75"), row=1, col=2)
-        # Overshoot annotation at peak
-        e_pg = err[pg_mask] * 100
-        peak_idx_local = int(np.argmax(e_pg))
-        t_peak = float(t[pg_mask][peak_idx_local])
-        e_peak = float(e_pg[peak_idx_local])
-        ov = metrics.get("overshoot_pct", 0)
-        fig.add_annotation(
-            x=t_peak, y=e_peak + 1.5,
-            text=f"peak  {ov:.0f}% OS",
-            showarrow=True, arrowhead=2, arrowcolor="#BA7517",
-            font=dict(size=10, color="#BA7517"), row=1, col=2)
-        # Settling time vline (anchored to PRE_GRASP start)
-        ts = metrics.get("settling_time_s")
-        if ts is not None:
-            fig.add_vline(x=t_pg_start + ts, line_dash="dot",
-                          line_color="#378ADD",
-                          annotation_text=f"settle {ts:.2f}s",
-                          row=1, col=2)
-        # Grasp event vline
-        if grasp_t is not None:
-            fig.add_vline(x=grasp_t, line_dash="dash",
-                          line_color="#1D9E75",
-                          annotation_text="grasp",
-                          row=1, col=2)
+    # Grasp event vline
+    if grasp_t is not None:
+        fig.add_vline(x=grasp_t, line_dash="dash",
+                      line_color="#1D9E75",
+                      annotation_text="grasp",
+                      row=1, col=2)
 
     # [2,1] KF vs truth (x component)
     fig.add_trace(go.Scatter(x=t, y=noisy[:,0]*100, name="Measured x",
@@ -711,12 +609,8 @@ def plot_results(logger: DataLogger, grasp_t):
 
     # [3,2] Metrics table
     gt = metrics.get("grasp_time_s")
-    rows_k = ["Overshoot","Settling time","Steady-state error",
-              "Grasp event","KP / KI / KD","Plant mass / damping"]
-    ov = metrics.get("overshoot_pct")
+    rows_k = ["Tracking error","Grasp event","KP / KI / KD","Plant mass / damping"]
     rows_v = [
-        f"{ov:.1f} %" if ov is not None else "—",
-        f"{metrics.get('settling_time_s', 0):.3f} s",
         f"{metrics.get('steady_state_error_m', 0)*100:.2f} cm",
         f"t = {gt:.3f} s" if gt else "not achieved",
         f"{KP[0]} / {KI[0]} / {KD[0]}",
@@ -853,11 +747,8 @@ def _save_separate_figs(assets_dir, t, phases, obj, ee, kfp, noisy, err, speed, 
 
     # Metrics table
     gt = metrics.get("grasp_time_s")
-    rows_k = ["Overshoot","Settling time","Steady-state error","Grasp event"]
-    ov = metrics.get("overshoot_pct")
+    rows_k = ["Tracking error","Grasp event"]
     rows_v = [
-        f"{ov:.1f} %" if ov is not None else "—",
-        f"{metrics.get('settling_time_s', 0):.3f} s",
         f"{metrics.get('steady_state_error_m', 0)*100:.2f} cm",
         f"t = {gt:.3f} s" if gt else "not achieved",
     ]

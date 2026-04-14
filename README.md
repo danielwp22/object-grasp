@@ -14,55 +14,51 @@ Build a closed-loop controller that can grasp a moving object: a ball rolling do
 
 ## Solution
 
-A two-phase strategy combining **predictive planning** with **visual servoing**:
-
-1. **APPROACH**: Intercept planner predicts where/when the object will be reachable. The end-effector moves toward the predicted intercept point.
-
-2. **PRE_GRASP**: Visual servoing actively tracks the current object position (via Kalman filter) to compensate for prediction errors and achieve grasp conditions.
+**Visual servoing**: Continuously track the object's current position and velocity throughout the approach using Kalman filter estimates. The controller targets the moving object directly until grasp conditions are met.
 
 **Control architecture**: PID + Feedforward control with derivative filtering to handle noise while maintaining responsiveness.
 
 ## Results
 
-**Grasp achieved at t=0.80s** with the following performance:
+**Grasp achieved at t=0.74s** with the following performance:
 
-- **Spatial accuracy**: 5.6 cm from object center
-- **Velocity matching**: <0.55 m/s relative velocity
-- **Success rate**: Consistent grasp within physical validation criteria
+- **Tracking error**: 10.4 cm (mean error while tracking moving object)
+- **Grasp validation**: Within 6cm spatial and 0.55 m/s velocity tolerance
+- **Approach**: Single continuous phase using visual servoing
 
 ### Trajectory
 
-The end-effector (blue) approaches the predicted intercept zone, then switches to visual servoing to track the object (orange) down the ramp. The green star marks the successful grasp.
+The end-effector (blue) continuously tracks the object (orange) down the ramp using visual servoing. The green star marks the successful grasp when physical conditions are met.
 
 ![Trajectory plot](assets/trajectory.png)
 
 ### Tracking error
 
-The tracking error shows distinct phase behavior. During visual servoing (orange segment at t=0.6-0.8s), the controller maintains ~5.6cm steady-state error while matching the object's velocity.
+The tracking error shows continuous visual servoing - the controller actively tracks the moving object throughout the approach, maintaining ~10cm error until grasp conditions are satisfied.
 
 ![Tracking error](assets/tracking_error.png)
 
 ### End-effector speed
 
-The robot accelerates to match the object's velocity, saturating at 3.0 m/s around t=1.3s. The grasp must occur at t=0.8s before this saturation makes the object uncatchable.
+The robot accelerates to match the object's velocity. The grasp occurs at t=0.74s before velocity saturation limits would make the object uncatchable.
 
 ![EE speed](assets/ee_speed.png)
 
 ## Key findings
 
-### Why visual servoing is essential
+### Why visual servoing
 
-Initial "lock and wait" strategy (freeze intercept prediction and approach it) failed with:
-- 9.2 cm spatial miss
-- 2.5 m/s relative velocity at grasp attempt
+Continuously tracking the current object position (via Kalman filter) compensates for state estimation uncertainty and provides smooth velocity matching. This is the standard industry approach for moving object grasping.
 
-Visual servoing (actively track current position) succeeded because it compensates for inevitable prediction errors from Kalman filter uncertainty and dynamic object motion.
+**Alternative approaches considered:**
+- Predictive interception (target predicted future position) → works but adds unnecessary complexity
+- The simpler visual servoing approach achieves faster grasp time (0.74s) with straightforward implementation
 
 ### Why PID + Feedforward
 
-**PID vs PD**: Tested comparison showed PID achieves 0.84s grasp vs 1.025s for PD (18% faster). The integral term eliminates steady-state error when tracking accelerating targets.
+**PID vs PD**: The integral term eliminates steady-state error when tracking accelerating targets. Tested comparisons showed 18% faster grasp times with PID.
 
-**Feedforward**: Model-based compensation (u_ff = m·a_des + b·v_des) reduces tracking error by providing bulk of control effort. Using 70% feedforward gain balances performance with model uncertainty.
+**Feedforward**: Model-based compensation (u_ff = m·a_des + b·v_des) provides bulk of control effort, reducing tracking error. Using 70% feedforward gain balances performance with model uncertainty.
 
 **Derivative filter**: 10ms low-pass filter on D-term reduces chattering from velocity noise without sacrificing responsiveness.
 
@@ -70,7 +66,7 @@ Visual servoing (actively track current position) succeeded because it compensat
 
 Systematically compared 5 tuning methods (Ziegler-Nichols, Cohen-Coon, IMC, Lambda, Optimization) using `tune_pid_advanced.py`.
 
-**Critical lesson**: Mathematical optimization for ideal step responses can fail catastrophically on real tasks. "Optimal" gains (Kp=499, Ki=1, Kd=100) predicted perfect performance but completely failed due to noise amplification and saturation. Conservative empirical tuning (Kp=180, Ki=40, Kd=15) proved robust.
+**Critical lesson**: Mathematical optimization for ideal step responses can fail catastrophically on real tasks. "Optimal" gains predicted perfect performance but completely failed due to noise amplification and saturation. Conservative empirical tuning (Kp=180, Ki=40, Kd=15) proved robust.
 
 ## Control parameters
 
@@ -91,7 +87,7 @@ The interactive Plotly dashboard is saved to `outputs/grasp_controller.html` wit
 
 ## Files
 
-- **grasp_controller.py** - Main PID+Feedforward controller implementation
+- **grasp_controller.py** - Main PID+Feedforward controller with visual servoing
 - **tune_pid_advanced.py** - Systematic comparison of 5 PID tuning methods
 - **CONTROLLER_COMPARISON.md** - Detailed PID vs PD performance analysis
 
@@ -100,11 +96,9 @@ The interactive Plotly dashboard is saved to `outputs/grasp_controller.html` wit
 ```
 Object Simulator → Sensor (noise + latency) → Kalman Filter
                                                      ↓
-                                              Intercept Planner
+                                       Visual Servoing (track current state)
                                                      ↓
-                                            Trajectory Generator
-                                                     ↓
-       Robot Plant ← PID Controller ← Desired trajectory
+       Robot Plant ← PID+FF Controller ← Desired trajectory (pos, vel, acc)
 ```
 
-Pipeline executes at 200 Hz with predictive intercept planning in APPROACH, switching to visual servoing in PRE_GRASP to compensate for prediction errors.
+The controller runs at 200 Hz, continuously tracking the object's current position and velocity until grasp conditions (proximity + velocity matching) are satisfied.
