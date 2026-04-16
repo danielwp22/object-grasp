@@ -48,7 +48,7 @@ The robot accelerates to match the object's velocity. The grasp occurs at t=0.74
 
 ### Why visual servoing
 
-Continuously tracking the current object position (via Kalman filter) compensates for state estimation uncertainty and provides smooth velocity matching. This is the standard industry approach for moving object grasping.
+Continuously tracking the current object position (via Kalman filter) compensates for state estimation uncertainty and provides smooth velocity matching. The Kalman filter also compensates for the 15ms sensor latency by predicting forward to estimate the current state from delayed measurements. This is the standard industry approach for moving object grasping.
 
 **Alternative approaches considered:**
 - Predictive interception (target predicted future position) → works but adds unnecessary complexity
